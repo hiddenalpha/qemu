@@ -222,6 +222,9 @@ static int net_socket_mcast_create(struct sockaddr_in *mcastaddr,
 #else
     int loop;
 #endif
+#if __WIN32
+    struct in_addr origAddr;
+#endif
 
     if (!IN_MULTICAST(ntohl(mcastaddr->sin_addr.s_addr))) {
         error_setg(errp, "specified mcastaddr %s (0x%08x) "
@@ -250,12 +253,28 @@ static int net_socket_mcast_create(struct sockaddr_in *mcastaddr,
         goto fail;
     }
 
+#if __WIN32
+    /* Listen on mcast addr doesn't work on windoof. See
+     * [source](https://serverfault.com/a/1002999/673216). Therefore we'll
+     * use either 'localaddr' (if any) or 'INADDR_ANY' as suggested on
+     * serverfault. */
+    origAddr = mcastaddr->sin_addr;
+    mcastaddr->sin_addr = (localaddr != NULL) ? *localaddr : htonl(INADDR_ANY);
+#   define RESTORE_ADDR() { mcastaddr->sin_addr = origAddr; }
+#else
+#   define RESTORE_ADDR() /* no-op */
+#endif
+
     ret = bind(fd, (struct sockaddr *)mcastaddr, sizeof(*mcastaddr));
     if (ret < 0) {
         error_setg_errno(errp, errno, "can't bind ip=%s to socket",
                          inet_ntoa(mcastaddr->sin_addr));
+        RESTORE_ADDR();
         goto fail;
     }
+
+    RESTORE_ADDR();
+#undef RESTORE_ADDR
 
     /* Add host to multicast group */
     imr.imr_multiaddr = mcastaddr->sin_addr;
