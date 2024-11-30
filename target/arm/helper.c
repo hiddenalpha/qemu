@@ -19,7 +19,7 @@
 #include "qemu/crc32c.h"
 #include "qemu/qemu-print.h"
 #include "exec/exec-all.h"
-#include <zlib.h> /* For crc32 */
+#include <zlib.h> /* for crc32 */
 #include "hw/irq.h"
 #include "sysemu/cpu-timers.h"
 #include "sysemu/kvm.h"
@@ -444,6 +444,9 @@ static int alle1_tlbmask(CPUARMState *env)
      * Note that the 'ALL' scope must invalidate both stage 1 and
      * stage 2 translations, whereas most other scopes only invalidate
      * stage 1 translations.
+     *
+     * For AArch32 this is only used for TLBIALLNSNH and VTTBR
+     * writes, so only needs to apply to NS PL1&0, not S PL1&0.
      */
     return (ARMMMUIdxBit_E10_1 |
             ARMMMUIdxBit_E10_1_PAN |
@@ -3599,11 +3602,12 @@ static uint64_t do_ats_write(CPUARMState *env, uint64_t value,
     GetPhysAddrResult res = {};
 
     /*
-     * I_MXTJT: Granule protection checks are not performed on the final address
-     * of a successful translation.
+     * I_MXTJT: Granule protection checks are not performed on the final
+     * address of a successful translation.  This is a translation not a
+     * memory reference, so "memop = none = 0".
      */
-    ret = get_phys_addr_with_space_nogpc(env, value, access_type, mmu_idx, ss,
-                                         &res, &fi);
+    ret = get_phys_addr_with_space_nogpc(env, value, access_type, 0,
+                                         mmu_idx, ss, &res, &fi);
 
     /*
      * ATS operations only do S1 or S1+S2 translations, so we never
@@ -3775,7 +3779,11 @@ static void ats_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
         /* stage 1 current state PL1: ATS1CPR, ATS1CPW, ATS1CPRP, ATS1CPWP */
         switch (el) {
         case 3:
-            mmu_idx = ARMMMUIdx_E3;
+            if (ri->crm == 9 && arm_pan_enabled(env)) {
+                mmu_idx = ARMMMUIdx_E30_3_PAN;
+            } else {
+                mmu_idx = ARMMMUIdx_E3;
+            }
             break;
         case 2:
             g_assert(ss != ARMSS_Secure);  /* ARMv8.4-SecEL2 is 64-bit only */
@@ -3795,7 +3803,7 @@ static void ats_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
         /* stage 1 current state PL0: ATS1CUR, ATS1CUW */
         switch (el) {
         case 3:
-            mmu_idx = ARMMMUIdx_E10_0;
+            mmu_idx = ARMMMUIdx_E30_0;
             break;
         case 2:
             g_assert(ss != ARMSS_Secure);  /* ARMv8.4-SecEL2 is 64-bit only */
@@ -4905,11 +4913,14 @@ static int vae1_tlbmask(CPUARMState *env)
     uint64_t hcr = arm_hcr_el2_eff(env);
     uint16_t mask;
 
+    assert(arm_feature(env, ARM_FEATURE_AARCH64));
+
     if ((hcr & (HCR_E2H | HCR_TGE)) == (HCR_E2H | HCR_TGE)) {
         mask = ARMMMUIdxBit_E20_2 |
                ARMMMUIdxBit_E20_2_PAN |
                ARMMMUIdxBit_E20_0;
     } else {
+        /* This is AArch64 only, so we don't need to touch the EL30_x TLBs */
         mask = ARMMMUIdxBit_E10_1 |
                ARMMMUIdxBit_E10_1_PAN |
                ARMMMUIdxBit_E10_0;
@@ -4947,6 +4958,8 @@ static int vae1_tlbbits(CPUARMState *env, uint64_t addr)
 {
     uint64_t hcr = arm_hcr_el2_eff(env);
     ARMMMUIdx mmu_idx;
+
+    assert(arm_feature(env, ARM_FEATURE_AARCH64));
 
     /* Only the regime of the mmu_idx below is significant. */
     if ((hcr & (HCR_E2H | HCR_TGE)) == (HCR_E2H | HCR_TGE)) {
@@ -6216,6 +6229,11 @@ static void hcrx_write(CPUARMState *env, const ARMCPRegInfo *ri,
     if (cpu_isar_feature(aa64_nmi, cpu)) {
         valid_mask |= HCRX_TALLINT | HCRX_VINMI | HCRX_VFNMI;
     }
+    /* FEAT_CMOW adds CMOW */
+
+    if (cpu_isar_feature(aa64_cmow, cpu)) {
+        valid_mask |= HCRX_CMOW;
+    }
 
     /* Clear RES0 bits.  */
     env->cp15.hcrx_el2 = value & valid_mask;
@@ -7232,7 +7250,7 @@ uint32_t sve_vqm1_for_el_sm(CPUARMState *env, int el, bool sm)
     if (el <= 1 && !el_is_in_host(env, el)) {
         len = MIN(len, 0xf & (uint32_t)cr[1]);
     }
-    if (el <= 2 && arm_feature(env, ARM_FEATURE_EL2)) {
+    if (el <= 2 && arm_is_el2_enabled(env)) {
         len = MIN(len, 0xf & (uint32_t)cr[2]);
     }
     if (arm_feature(env, ARM_FEATURE_EL3)) {
@@ -11861,10 +11879,20 @@ void arm_cpu_do_interrupt(CPUState *cs)
 
 uint64_t arm_sctlr(CPUARMState *env, int el)
 {
-    /* Only EL0 needs to be adjusted for EL1&0 or EL2&0. */
+    /* Only EL0 needs to be adjusted for EL1&0 or EL2&0 or EL3&0 */
     if (el == 0) {
         ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, 0);
-        el = mmu_idx == ARMMMUIdx_E20_0 ? 2 : 1;
+        switch (mmu_idx) {
+        case ARMMMUIdx_E20_0:
+            el = 2;
+            break;
+        case ARMMMUIdx_E30_0:
+            el = 3;
+            break;
+        default:
+            el = 1;
+            break;
+        }
     }
     return env->cp15.sctlr_el[el];
 }
@@ -12532,6 +12560,7 @@ int arm_mmu_idx_to_el(ARMMMUIdx mmu_idx)
     switch (mmu_idx) {
     case ARMMMUIdx_E10_0:
     case ARMMMUIdx_E20_0:
+    case ARMMMUIdx_E30_0:
         return 0;
     case ARMMMUIdx_E10_1:
     case ARMMMUIdx_E10_1_PAN:
@@ -12541,6 +12570,7 @@ int arm_mmu_idx_to_el(ARMMMUIdx mmu_idx)
     case ARMMMUIdx_E20_2_PAN:
         return 2;
     case ARMMMUIdx_E3:
+    case ARMMMUIdx_E30_3_PAN:
         return 3;
     default:
         g_assert_not_reached();
@@ -12569,6 +12599,9 @@ ARMMMUIdx arm_mmu_idx_el(CPUARMState *env, int el)
         hcr = arm_hcr_el2_eff(env);
         if ((hcr & (HCR_E2H | HCR_TGE)) == (HCR_E2H | HCR_TGE)) {
             idx = ARMMMUIdx_E20_0;
+        } else if (arm_is_secure_below_el3(env) &&
+                   !arm_el_is_aa64(env, 3)) {
+            idx = ARMMMUIdx_E30_0;
         } else {
             idx = ARMMMUIdx_E10_0;
         }
@@ -12593,6 +12626,9 @@ ARMMMUIdx arm_mmu_idx_el(CPUARMState *env, int el)
         }
         break;
     case 3:
+        if (!arm_el_is_aa64(env, 3) && arm_pan_enabled(env)) {
+            return ARMMMUIdx_E30_3_PAN;
+        }
         return ARMMMUIdx_E3;
     default:
         g_assert_not_reached();

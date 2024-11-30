@@ -32,6 +32,7 @@
 #include "migration/vmstate.h"
 #include "hw/scsi/emulation.h"
 #include "scsi/constants.h"
+#include "sysemu/arch_init.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
 #include "hw/block/block.h"
@@ -65,6 +66,13 @@ OBJECT_DECLARE_TYPE(SCSIDiskState, SCSIDiskClass, SCSI_DISK_BASE)
 
 struct SCSIDiskClass {
     SCSIDeviceClass parent_class;
+    /*
+     * Callbacks receive ret == 0 for success. Errors are represented either as
+     * negative errno values, or as positive SAM status codes.
+     *
+     * Beware: For errors returned in host_status, the function may directly
+     * complete the request and never call the callback.
+     */
     DMAIOFunc       *dma_readv;
     DMAIOFunc       *dma_writev;
     bool            (*need_fua_emulation)(SCSICommand *cmd);
@@ -104,6 +112,7 @@ struct SCSIDiskState {
     char *vendor;
     char *product;
     char *device_id;
+    char *loadparm;     /* only for s390x */
     bool tray_open;
     bool tray_locked;
     /*
@@ -217,7 +226,7 @@ static bool scsi_handle_rw_error(SCSIDiskReq *r, int ret, bool acct_failed)
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
     SCSIDiskClass *sdc = (SCSIDiskClass *) object_get_class(OBJECT(s));
     SCSISense sense = SENSE_CODE(NO_SENSE);
-    int error = 0;
+    int error;
     bool req_has_sense = false;
     BlockErrorAction action;
     int status;
@@ -228,11 +237,35 @@ static bool scsi_handle_rw_error(SCSIDiskReq *r, int ret, bool acct_failed)
     } else {
         /* A passthrough command has completed with nonzero status.  */
         status = ret;
-        if (status == CHECK_CONDITION) {
+        switch (status) {
+        case CHECK_CONDITION:
             req_has_sense = true;
             error = scsi_sense_buf_to_errno(r->req.sense, sizeof(r->req.sense));
-        } else {
+            break;
+        case RESERVATION_CONFLICT:
+            /*
+             * Don't apply the error policy, always report to the guest.
+             *
+             * This is a passthrough code path, so it's not a backend error, but
+             * a response to an invalid guest request.
+             *
+             * Windows Failover Cluster validation intentionally sends invalid
+             * requests to verify that reservations work as intended. It is
+             * crucial that it sees the resulting errors.
+             *
+             * Treating a reservation conflict as a guest-side error is obvious
+             * when a pr-manager is in use. Without one, the situation is less
+             * clear, but there might be nothing that can be fixed on the host
+             * (like in the above example), and we don't want to be stuck in a
+             * loop where resuming the VM and retrying the request immediately
+             * stops it again. So always reporting is still the safer option in
+             * this case, too.
+             */
+            error = 0;
+            break;
+        default:
             error = EINVAL;
+            break;
         }
     }
 
@@ -242,8 +275,9 @@ static bool scsi_handle_rw_error(SCSIDiskReq *r, int ret, bool acct_failed)
      * are usually retried immediately, so do not post them to QMP and
      * do not account them as failed I/O.
      */
-    if (req_has_sense &&
-        scsi_sense_buf_is_guest_recoverable(r->req.sense, sizeof(r->req.sense))) {
+    if (!error || (req_has_sense &&
+                   scsi_sense_buf_is_guest_recoverable(r->req.sense,
+                                                       sizeof(r->req.sense)))) {
         action = BLOCK_ERROR_ACTION_REPORT;
         acct_failed = false;
     } else {
@@ -283,7 +317,7 @@ static bool scsi_disk_req_check_error(SCSIDiskReq *r, int ret, bool acct_failed)
         return true;
     }
 
-    if (ret < 0) {
+    if (ret != 0) {
         return scsi_handle_rw_error(r, ret, acct_failed);
     }
 
@@ -360,7 +394,7 @@ static void scsi_write_do_fua(SCSIDiskReq *r)
 static void scsi_dma_complete_noio(SCSIDiskReq *r, int ret)
 {
     assert(r->req.aiocb == NULL);
-    if (scsi_disk_req_check_error(r, ret, false)) {
+    if (scsi_disk_req_check_error(r, ret, ret > 0)) {
         goto done;
     }
 
@@ -377,6 +411,7 @@ done:
     scsi_req_unref(&r->req);
 }
 
+/* May not be called in all error cases, don't rely on cleanup here */
 static void scsi_dma_complete(void *opaque, int ret)
 {
     SCSIDiskReq *r = (SCSIDiskReq *)opaque;
@@ -385,9 +420,10 @@ static void scsi_dma_complete(void *opaque, int ret)
     assert(r->req.aiocb != NULL);
     r->req.aiocb = NULL;
 
+    /* ret > 0 is accounted for in scsi_disk_req_check_error() */
     if (ret < 0) {
         block_acct_failed(blk_get_stats(s->qdev.conf.blk), &r->acct);
-    } else {
+    } else if (ret == 0) {
         block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
     }
     scsi_dma_complete_noio(r, ret);
@@ -403,7 +439,7 @@ static void scsi_read_complete_noio(SCSIDiskReq *r, int ret)
            qemu_get_current_aio_context());
 
     assert(r->req.aiocb == NULL);
-    if (scsi_disk_req_check_error(r, ret, false)) {
+    if (scsi_disk_req_check_error(r, ret, ret > 0)) {
         goto done;
     }
 
@@ -416,6 +452,7 @@ done:
     scsi_req_unref(&r->req);
 }
 
+/* May not be called in all error cases, don't rely on cleanup here */
 static void scsi_read_complete(void *opaque, int ret)
 {
     SCSIDiskReq *r = (SCSIDiskReq *)opaque;
@@ -424,9 +461,10 @@ static void scsi_read_complete(void *opaque, int ret)
     assert(r->req.aiocb != NULL);
     r->req.aiocb = NULL;
 
+    /* ret > 0 is accounted for in scsi_disk_req_check_error() */
     if (ret < 0) {
         block_acct_failed(blk_get_stats(s->qdev.conf.blk), &r->acct);
-    } else {
+    } else if (ret == 0) {
         block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
         trace_scsi_disk_read_complete(r->req.tag, r->qiov.size);
     }
@@ -534,7 +572,7 @@ static void scsi_write_complete_noio(SCSIDiskReq *r, int ret)
            qemu_get_current_aio_context());
 
     assert (r->req.aiocb == NULL);
-    if (scsi_disk_req_check_error(r, ret, false)) {
+    if (scsi_disk_req_check_error(r, ret, ret > 0)) {
         goto done;
     }
 
@@ -554,6 +592,7 @@ done:
     scsi_req_unref(&r->req);
 }
 
+/* May not be called in all error cases, don't rely on cleanup here */
 static void scsi_write_complete(void * opaque, int ret)
 {
     SCSIDiskReq *r = (SCSIDiskReq *)opaque;
@@ -562,9 +601,10 @@ static void scsi_write_complete(void * opaque, int ret)
     assert (r->req.aiocb != NULL);
     r->req.aiocb = NULL;
 
+    /* ret > 0 is accounted for in scsi_disk_req_check_error() */
     if (ret < 0) {
         block_acct_failed(blk_get_stats(s->qdev.conf.blk), &r->acct);
-    } else {
+    } else if (ret == 0) {
         block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
     }
     scsi_write_complete_noio(r, ret);
@@ -2814,6 +2854,7 @@ static void scsi_block_sgio_complete(void *opaque, int ret)
     sg_io_hdr_t *io_hdr = &req->io_header;
 
     if (ret == 0) {
+        /* FIXME This skips calling req->cb() and any cleanup in it */
         if (io_hdr->host_status != SCSI_HOST_OK) {
             scsi_req_complete_failed(&r->req, io_hdr->host_status);
             scsi_req_unref(&r->req);
@@ -2824,16 +2865,6 @@ static void scsi_block_sgio_complete(void *opaque, int ret)
             ret = BUSY;
         } else {
             ret = io_hdr->status;
-        }
-
-        if (ret > 0) {
-            if (scsi_handle_rw_error(r, ret, true)) {
-                scsi_req_unref(&r->req);
-                return;
-            }
-
-            /* Ignore error.  */
-            ret = 0;
         }
     }
 
@@ -3106,13 +3137,50 @@ BlockAIOCB *scsi_dma_writev(int64_t offset, QEMUIOVector *iov,
     return blk_aio_pwritev(s->qdev.conf.blk, offset, iov, 0, cb, cb_opaque);
 }
 
+static char *scsi_property_get_loadparm(Object *obj, Error **errp)
+{
+    return g_strdup(SCSI_DISK_BASE(obj)->loadparm);
+}
+
+static void scsi_property_set_loadparm(Object *obj, const char *value,
+                                       Error **errp)
+{
+    void *lp_str;
+
+    if (object_property_get_int(obj, "bootindex", NULL) < 0) {
+        error_setg(errp, "'loadparm' is only valid for boot devices");
+        return;
+    }
+
+    lp_str = g_malloc0(strlen(value) + 1);
+    if (!qdev_prop_sanitize_s390x_loadparm(lp_str, value, errp)) {
+        g_free(lp_str);
+        return;
+    }
+    SCSI_DISK_BASE(obj)->loadparm = lp_str;
+}
+
+static void scsi_property_add_specifics(DeviceClass *dc)
+{
+    ObjectClass *oc = OBJECT_CLASS(dc);
+
+    /* The loadparm property is only supported on s390x */
+    if (arch_type & QEMU_ARCH_S390X) {
+        object_class_property_add_str(oc, "loadparm",
+                                      scsi_property_get_loadparm,
+                                      scsi_property_set_loadparm);
+        object_class_property_set_description(oc, "loadparm",
+                                              "load parameter (s390x only)");
+    }
+}
+
 static void scsi_disk_base_class_initfn(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SCSIDiskClass *sdc = SCSI_DISK_BASE_CLASS(klass);
 
     dc->fw_name = "disk";
-    dc->reset = scsi_disk_reset;
+    device_class_set_legacy_reset(dc, scsi_disk_reset);
     sdc->dma_readv = scsi_dma_readv;
     sdc->dma_writev = scsi_dma_writev;
     sdc->need_fua_emulation = scsi_is_cmd_fua;
@@ -3189,6 +3257,8 @@ static void scsi_hd_class_initfn(ObjectClass *klass, void *data)
     dc->desc = "virtual SCSI disk";
     device_class_set_props(dc, scsi_hd_properties);
     dc->vmsd  = &vmstate_scsi_disk_state;
+
+    scsi_property_add_specifics(dc);
 }
 
 static const TypeInfo scsi_hd_info = {
@@ -3229,6 +3299,8 @@ static void scsi_cd_class_initfn(ObjectClass *klass, void *data)
     dc->desc = "virtual SCSI CD-ROM";
     device_class_set_props(dc, scsi_cd_properties);
     dc->vmsd  = &vmstate_scsi_disk_state;
+
+    scsi_property_add_specifics(dc);
 }
 
 static const TypeInfo scsi_cd_info = {
